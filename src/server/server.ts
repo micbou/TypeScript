@@ -1,4 +1,3 @@
-/// <reference types="node" />
 /// <reference path="shared.ts" />
 /// <reference path="session.ts" />
 
@@ -7,7 +6,7 @@ namespace ts.server {
         host: ServerHost;
         cancellationToken: ServerCancellationToken;
         canUseEvents: boolean;
-        installerEventPort: number;
+        eventPort: number;
         useSingleInferredProject: boolean;
         useInferredProjectPerProjectRoot: boolean;
         disableAutomaticTypingAcquisition: boolean;
@@ -21,10 +20,6 @@ namespace ts.server {
         pluginProbeLocations: ReadonlyArray<string>;
         allowLocalPluginLoads: boolean;
     }
-
-    const net: {
-        connect(options: { port: number }, onConnect?: () => void): NodeSocket
-    } = require("net");
 
     const childProcess: {
         fork(modulePath: string, args: string[], options?: { execArgv: string[], env?: MapLike<string> }): NodeChildProcess;
@@ -81,10 +76,6 @@ namespace ts.server {
         on(message: "message" | "exit", f: (m: any) => void): void;
         kill(): void;
         pid: number;
-    }
-
-    interface NodeSocket {
-        write(data: string, encoding: string): boolean;
     }
 
     interface ReadLineOptions {
@@ -244,7 +235,6 @@ namespace ts.server {
     class NodeTypingsInstaller implements ITypingsInstaller {
         private installer: NodeChildProcess;
         private installerPidReported = false;
-        private socket: NodeSocket;
         private projectService: ProjectService;
         private eventSender: EventSender;
         private activeRequestCount = 0;
@@ -267,18 +257,11 @@ namespace ts.server {
             private readonly telemetryEnabled: boolean,
             private readonly logger: server.Logger,
             private readonly host: ServerHost,
-            eventPort: number,
             readonly globalTypingsCacheLocation: string,
             readonly typingSafeListLocation: string,
             readonly typesMapLocation: string,
-            private readonly npmLocation: string | undefined,
-            private newLine: string) {
-            if (eventPort) {
-                const s = net.connect({ port: eventPort }, () => {
-                    this.socket = s;
-                    this.reportInstallerProcessId();
-                });
-            }
+            private readonly npmLocation: string | undefined) {
+            this.reportInstallerProcessId();
         }
 
         isKnownTypesPackageName(name: string): boolean {
@@ -310,17 +293,21 @@ namespace ts.server {
             if (this.installerPidReported) {
                 return;
             }
-            if (this.socket && this.installer) {
-                this.sendEvent(0, "typingsInstallerPid", { pid: this.installer.pid });
+            if (this.installer) {
+                this.sendEvent("typingsInstallerPid", { pid: this.installer.pid });
                 this.installerPidReported = true;
             }
         }
 
-        private sendEvent(seq: number, event: string, body: any): void {
-            this.socket.write(formatMessage({ seq, type: "event", event, body }, this.logger, Buffer.byteLength, this.newLine), "utf8");
+        // TODO: do we need to retain the seq number?
+        private sendEvent(event: string, body: any): void {
+            if (this.eventSender) {
+                this.eventSender.event(body, event);
+            }
         }
 
-        setTelemetrySender(telemetrySender: EventSender) {
+        // TODO: can this be done during initialization instead of later?
+        public setTelemetrySender(telemetrySender: EventSender) {
             this.eventSender = telemetrySender;
         }
 
@@ -508,9 +495,7 @@ namespace ts.server {
 
                     this.projectService.updateTypingsForProject(response);
 
-                    if (this.socket) {
-                        this.sendEvent(0, "setTypings", response);
-                    }
+                    this.sendEvent("setTypings", response);
 
                     break;
                 }
@@ -530,10 +515,10 @@ namespace ts.server {
 
     class IOSession extends Session {
         constructor(options: IOSessionOptions) {
-            const { host, installerEventPort, globalTypingsCacheLocation, typingSafeListLocation, typesMapLocation, npmLocation, canUseEvents } = options;
+            const { host, eventPort, globalTypingsCacheLocation, typingSafeListLocation, typesMapLocation, npmLocation, canUseEvents } = options;
             const typingsInstaller = disableAutomaticTypingAcquisition
                 ? undefined
-                : new NodeTypingsInstaller(telemetryEnabled, logger, host, installerEventPort, globalTypingsCacheLocation, typingSafeListLocation, typesMapLocation, npmLocation, host.newLine);
+                : new NodeTypingsInstaller(telemetryEnabled, logger, host, globalTypingsCacheLocation, typingSafeListLocation, typesMapLocation, npmLocation);
 
             super({
                 host,
@@ -545,6 +530,7 @@ namespace ts.server {
                 hrtime: process.hrtime,
                 logger,
                 canUseEvents,
+                eventPort,
                 globalPlugins: options.globalPlugins,
                 pluginProbeLocations: options.pluginProbeLocations,
                 allowLocalPluginLoads: options.allowLocalPluginLoads });
@@ -936,8 +922,8 @@ namespace ts.server {
     const options: IOSessionOptions = {
         host: sys,
         cancellationToken,
-        installerEventPort: eventPort,
-        canUseEvents: eventPort === undefined,
+        eventPort,
+        canUseEvents: true,
         useSingleInferredProject,
         useInferredProjectPerProjectRoot,
         disableAutomaticTypingAcquisition,

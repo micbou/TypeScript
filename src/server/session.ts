@@ -1,9 +1,19 @@
+/// <reference types="node" />
 /// <reference path="..\compiler\commandLineParser.ts" />
 /// <reference path="..\services\services.ts" />
 /// <reference path="protocol.ts" />
 /// <reference path="editorServices.ts" />
 
 namespace ts.server {
+
+    interface NodeSocket {
+        write(data: string, encoding: string): boolean;
+    }
+
+    const net: {
+        connect(options: { port: number }, onConnect?: () => void): NodeSocket
+    } = require("net");
+
     interface StackTraceError extends Error {
         stack?: string;
     }
@@ -252,7 +262,13 @@ namespace ts.server {
         byteLength: (buf: string, encoding?: string) => number;
         hrtime: (start?: number[]) => number[];
         logger: Logger;
+        /** @deprecated */
         canUseEvents: boolean;
+        /**
+         * If defined, the Session will send events through `eventPort` instead of stdout.
+         */
+        eventPort?: number;
+        /** @deprecated */
         eventHandler?: ProjectServiceEventHandler;
         throttleWaitMilliseconds?: number;
 
@@ -269,15 +285,21 @@ namespace ts.server {
         private currentRequestId: number;
         private errorCheck: MultistepOperation;
 
-        private eventHandler: ProjectServiceEventHandler;
-
         private host: ServerHost;
         private readonly cancellationToken: ServerCancellationToken;
         protected readonly typingsInstaller: ITypingsInstaller;
         private byteLength: (buf: string, encoding?: string) => number;
         private hrtime: (start?: number[]) => number[];
         protected logger: Logger;
+
         private canUseEvents: boolean;
+        /**
+         * Events are sent through stdout iff `eventPort` is undefined
+         */
+        private eventPort: number | undefined;
+        private eventSocket: NodeSocket;
+        private eventHandler: ProjectServiceEventHandler;
+        public event: EventSender["event"];
 
         constructor(opts: SessionOptions) {
             this.host = opts.host;
@@ -286,14 +308,45 @@ namespace ts.server {
             this.byteLength = opts.byteLength;
             this.hrtime = opts.hrtime;
             this.logger = opts.logger;
+            this.eventPort = opts.eventPort;
             this.canUseEvents = opts.canUseEvents;
 
             const { throttleWaitMilliseconds } = opts;
 
+            if (!this.canUseEvents) {
+                this.event = noop;
+            }
+            else if (this.eventPort) {
+                const s = net.connect({ port: this.eventPort }, () => {
+                    this.eventSocket = s;
+                });
+
+                this.event = function <T>(info: T, eventName: string) {
+                    if (!this.eventSocket) {
+                        if (this.logger.hasLevel(LogLevel.verbose)) {
+                            this.logger.info(`eventPort: event queued, but socket not yet initialized`);
+                            // TODO: handle... by queueing?
+                        }
+                        return;
+                    }
+                    this.eventSocket.write(formatMessage({ seq: 0, type: "event", event: eventName, body: info }, this.logger, Buffer.byteLength, this.host.newLine), "utf8");
+                };
+            }
+            else {
+                this.event = function <T>(info: T, eventName: string) {
+                    const ev: protocol.Event = {
+                        seq: 0,
+                        type: "event",
+                        event: eventName,
+                        body: info
+                    };
+                    this.send(ev);
+                };
+            }
+
             this.eventHandler = this.canUseEvents
                 ? opts.eventHandler || (event => this.defaultEventHandler(event))
                 : undefined;
-
             const multistepOperationHost: MultistepOperationHost = {
                 executeWithRequestId: (requestId, action) => this.executeWithRequestId(requestId, action),
                 getCurrentRequestId: () => this.currentRequestId,
@@ -321,13 +374,7 @@ namespace ts.server {
         }
 
         private sendRequestCompletedEvent(requestId: number): void {
-            const event: protocol.RequestCompletedEvent = {
-                seq: 0,
-                type: "event",
-                event: "requestCompleted",
-                body: { request_seq: requestId }
-            };
-            this.send(event);
+            this.event<protocol.RequestCompletedEventBody>({ request_seq: requestId }, "requestCompleted");
         }
 
         private defaultEventHandler(event: ProjectServiceEvent) {
@@ -392,26 +439,15 @@ namespace ts.server {
         }
 
         public send(msg: protocol.Message) {
-            if (msg.type === "event" && !this.canUseEvents) {
-                if (this.logger.hasLevel(LogLevel.verbose)) {
-                    this.logger.info(`Session does not support events: ignored event: ${JSON.stringify(msg)}`);
-                }
-                return;
+            if (msg.type === "event") {
+                Debug.assert(this.canUseEvents);
+                Debug.assert(!this.eventPort);
             }
             this.host.write(formatMessage(msg, this.logger, this.byteLength, this.host.newLine));
         }
 
-        public event<T>(info: T, eventName: string) {
-            const ev: protocol.Event = {
-                seq: 0,
-                type: "event",
-                event: eventName,
-                body: info
-            };
-            this.send(ev);
-        }
-
         // For backwards-compatibility only.
+        /** @deprecated */
         public output(info: any, cmdName: string, reqSeq?: number, errorMsg?: string): void {
             this.doOutput(info, cmdName, reqSeq, /*success*/ !errorMsg, errorMsg);
         }
